@@ -1,25 +1,25 @@
 package com.myphoneremote
 
 import android.content.Context
+import android.content.Intent
+import android.media.projection.MediaProjection
 import android.util.Log
+import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.database.*
 import org.webrtc.*
 
 class WebRtcManager(
     private val context: Context,
-    private val sessionId: String,
-    private val isCaller: Boolean,
-    private val onRemoteVideo: (VideoTrack) -> Unit,
-    private val onConnectionState: (String) -> Unit
+    private val code: String,
+    private val controller: Boolean,
+    private val onVideo: (VideoTrack, EglBase.Context) -> Unit,
+    private val onStatus: (String) -> Unit
 ) {
-
     companion object {
-        private const val TAG = "WebRtcManager"
-
-        private var initialized = false
+        @Volatile private var initialized = false
 
         @Synchronized
-        private fun initializeWebRtc(context: Context) {
+        private fun initialize(context: Context) {
             if (!initialized) {
                 PeerConnectionFactory.initialize(
                     PeerConnectionFactory.InitializationOptions
@@ -31,384 +31,472 @@ class WebRtcManager(
         }
     }
 
-    private val database = FirebaseDatabase.getInstance()
-        .reference
-        .child("webrtc")
-        .child(sessionId)
+    private val root = FirebaseDatabase.getInstance().reference
+    private val pairing = root.child("pairing").child(code)
+    private val signaling = root.child("webrtc").child(code)
 
+    private var pairingListener: ValueEventListener? = null
+    private var signalListener: ValueEventListener? = null
+
+    private var egl: EglBase? = null
     private var factory: PeerConnectionFactory? = null
-    private var peerConnection: PeerConnection? = null
-    private var signalingListener: ValueEventListener? = null
+    private var peer: PeerConnection? = null
+    private var source: VideoSource? = null
+    private var track: VideoTrack? = null
+    private var helper: SurfaceTextureHelper? = null
+    private var capturer: ScreenCapturerAndroid? = null
 
-    private var localVideoTrack: VideoTrack? = null
-
-    private var remoteDescriptionSet = false
-    private val pendingCandidates = mutableListOf<IceCandidate>()
-    private val processedCandidates = mutableSetOf<String>()
-
+    private var authorized = false
     private var closed = false
+    private var remotePending = false
+    private var remoteSet = false
 
-    fun start(videoTrack: VideoTrack? = null) {
+    private val candidates = mutableListOf<IceCandidate>()
+    private val seen = mutableSetOf<String>()
 
-        initializeWebRtc(context)
+    fun start(capturePermission: Intent? = null) {
+        val uid = FirebaseAuth.getInstance().currentUser?.uid
 
-        localVideoTrack = videoTrack
-
-        val eglBase = EglBase.create()
-
-        factory = PeerConnectionFactory.builder()
-            .setVideoEncoderFactory(
-                DefaultVideoEncoderFactory(
-                    eglBase.eglBaseContext,
-                    true,
-                    true
-                )
-            )
-            .setVideoDecoderFactory(
-                DefaultVideoDecoderFactory(
-                    eglBase.eglBaseContext
-                )
-            )
-            .createPeerConnectionFactory()
-
-        val iceServers = listOf(
-            PeerConnection.IceServer.builder(
-                "stun:stun.l.google.com:19302"
-            ).createIceServer()
-        )
-
-        val configuration = PeerConnection.RTCConfiguration(
-            iceServers
-        )
-
-        peerConnection = factory?.createPeerConnection(
-            configuration,
-            object : PeerConnection.Observer {
-
-                override fun onSignalingChange(
-                    state: PeerConnection.SignalingState?
-                ) {}
-
-                override fun onIceConnectionChange(
-                    state: PeerConnection.IceConnectionState?
-                ) {
-                    onConnectionState(
-                        state?.name ?: "UNKNOWN"
-                    )
-                }
-
-                override fun onIceConnectionReceivingChange(
-                    receiving: Boolean
-                ) {}
-
-                override fun onIceGatheringChange(
-                    state: PeerConnection.IceGatheringState?
-                ) {}
-
-                override fun onIceCandidate(
-                    candidate: IceCandidate?
-                ) {
-                    if (candidate != null) {
-                        sendIceCandidate(candidate)
-                    }
-                }
-
-                override fun onIceCandidatesRemoved(
-                    candidates: Array<out IceCandidate>?
-                ) {}
-
-                override fun onAddStream(
-                    stream: MediaStream?
-                ) {
-                    stream?.videoTracks?.firstOrNull()?.let {
-                        onRemoteVideo(it)
-                    }
-                }
-
-                override fun onRemoveStream(
-                    stream: MediaStream?
-                ) {}
-
-                override fun onDataChannel(
-                    channel: DataChannel?
-                ) {}
-
-                override fun onRenegotiationNeeded() {}
-
-                override fun onAddTrack(
-                    receiver: RtpReceiver?,
-                    streams: Array<out MediaStream>?
-                ) {
-                    val track = receiver?.track()
-                    if (track is VideoTrack) {
-                        onRemoteVideo(track)
-                    }
-                }
-            }
-        )
-
-        localVideoTrack?.let { track ->
-            peerConnection?.addTrack(
-                track,
-                listOf("screen_stream")
-            )
+        if (
+            uid == null ||
+            !code.matches(Regex("[0-9]{6}")) ||
+            (!controller && capturePermission == null)
+        ) {
+            onStatus("PAIRING_OR_PERMISSION_REQUIRED")
+            return
         }
 
-        listenForSignaling()
-
-        if (isCaller) {
-            createOffer()
-        }
-    }
-
-    private fun createOffer() {
-
-        peerConnection?.createOffer(
-            object : SdpObserver {
-
-                override fun onCreateSuccess(
-                    description: SessionDescription?
-                ) {
-                    if (description != null) {
-                        setLocalDescription(description)
-                    }
-                }
-
-                override fun onSetSuccess() {}
-
-                override fun onCreateFailure(error: String?) {
-                    Log.e(TAG, "Offer failed: $error")
-                }
-
-                override fun onSetFailure(error: String?) {}
-            },
-            MediaConstraints()
-        )
-    }
-
-    private fun createAnswer() {
-
-        peerConnection?.createAnswer(
-            object : SdpObserver {
-
-                override fun onCreateSuccess(
-                    description: SessionDescription?
-                ) {
-                    if (description != null) {
-                        setLocalDescription(description)
-                    }
-                }
-
-                override fun onSetSuccess() {}
-
-                override fun onCreateFailure(error: String?) {
-                    Log.e(TAG, "Answer failed: $error")
-                }
-
-                override fun onSetFailure(error: String?) {}
-            },
-            MediaConstraints()
-        )
-    }
-
-    private fun setLocalDescription(
-        description: SessionDescription
-    ) {
-
-        peerConnection?.setLocalDescription(
-            object : SdpObserver {
-
-                override fun onCreateSuccess(
-                    description: SessionDescription?
-                ) {}
-
-                override fun onSetSuccess() {
-
-                    val key = if (isCaller) {
-                        "offer"
-                    } else {
-                        "answer"
-                    }
-
-                    database.child(key).setValue(
-                        mapOf(
-                            "type" to description.type.name,
-                            "sdp" to description.description
-                        )
-                    )
-                }
-
-                override fun onCreateFailure(error: String?) {}
-
-                override fun onSetFailure(error: String?) {
-                    Log.e(TAG, "Local SDP error: $error")
-                }
-            },
-            description
-        )
-    }
-
-    private fun setRemoteDescription(
-        description: SessionDescription
-    ) {
-
-        peerConnection?.setRemoteDescription(
-            object : SdpObserver {
-
-                override fun onCreateSuccess(
-                    description: SessionDescription?
-                ) {}
-
-                override fun onSetSuccess() {
-
-                    remoteDescriptionSet = true
-
-                    pendingCandidates.forEach {
-                        peerConnection?.addIceCandidate(it)
-                    }
-
-                    pendingCandidates.clear()
-
-                    if (!isCaller &&
-                        description.type == SessionDescription.Type.OFFER
-                    ) {
-                        createAnswer()
-                    }
-                }
-
-                override fun onCreateFailure(error: String?) {}
-
-                override fun onSetFailure(error: String?) {
-                    Log.e(TAG, "Remote SDP error: $error")
-                }
-            },
-            description
-        )
-    }
-
-    private fun sendIceCandidate(
-        candidate: IceCandidate
-    ) {
-
-        val side = if (isCaller) {
-            "caller"
-        } else {
-            "receiver"
-        }
-
-        database.child("candidates")
-            .child(side)
-            .push()
-            .setValue(
-                mapOf(
-                    "sdpMid" to (candidate.sdpMid ?: ""),
-                    "sdpMLineIndex" to candidate.sdpMLineIndex,
-                    "sdp" to candidate.sdp
-                )
-            )
-    }
-
-    private fun listenForSignaling() {
-
-        signalingListener = object : ValueEventListener {
-
+        pairingListener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
-
                 if (closed) return
 
-                val remoteKey = if (isCaller) {
-                    "answer"
-                } else {
-                    "offer"
-                }
-
-                val descriptionSnapshot =
-                    snapshot.child(remoteKey)
-
-                val sdp = descriptionSnapshot
-                    .child("sdp")
+                val status = snapshot.child("status")
                     .getValue(String::class.java)
 
-                if (sdp != null && !remoteDescriptionSet) {
+                val expected = snapshot.child(
+                    if (controller) "controllerUid" else "receiverUid"
+                ).getValue(String::class.java)
 
-                    val type = if (isCaller) {
-                        SessionDescription.Type.ANSWER
-                    } else {
-                        SessionDescription.Type.OFFER
+                if (status != "connected" || expected != uid) {
+                    onStatus("NOT_AUTHORIZED")
+                    if (authorized) close()
+                    return
+                }
+
+                if (!authorized) {
+                    authorized = true
+                    setup(capturePermission)
+                }
+            }
+
+            override fun onCancelled(error: DatabaseError) {
+                onStatus("PAIRING_READ_ERROR: ${error.message}")
+            }
+        }
+
+        pairing.addValueEventListener(pairingListener!!)
+    }
+
+    private fun setup(permission: Intent?) {
+        try {
+            initialize(context)
+
+            egl = EglBase.create()
+
+            factory = PeerConnectionFactory.builder()
+                .setVideoEncoderFactory(
+                    DefaultVideoEncoderFactory(
+                        egl!!.eglBaseContext,
+                        true,
+                        true
+                    )
+                )
+                .setVideoDecoderFactory(
+                    DefaultVideoDecoderFactory(
+                        egl!!.eglBaseContext
+                    )
+                )
+                .createPeerConnectionFactory()
+
+            val servers = listOf(
+                PeerConnection.IceServer.builder(
+                    "stun:stun.l.google.com:19302"
+                ).createIceServer()
+            )
+
+            peer = factory!!.createPeerConnection(
+                PeerConnection.RTCConfiguration(servers),
+                object : PeerConnection.Observer {
+
+                    override fun onSignalingChange(
+                        state: PeerConnection.SignalingState?
+                    ) {}
+
+                    override fun onIceConnectionChange(
+                        state: PeerConnection.IceConnectionState?
+                    ) {
+                        onStatus(state?.name ?: "UNKNOWN")
                     }
 
-                    if (peerConnection?.remoteDescription == null) {
-                        setRemoteDescription(
-                            SessionDescription(type, sdp)
-                        )
+                    override fun onIceConnectionReceivingChange(
+                        receiving: Boolean
+                    ) {}
+
+                    override fun onIceGatheringChange(
+                        state: PeerConnection.IceGatheringState?
+                    ) {}
+
+                    override fun onIceCandidate(
+                        candidate: IceCandidate?
+                    ) {
+                        if (candidate != null && !closed) {
+                            val side = if (controller) {
+                                "controller"
+                            } else {
+                                "receiver"
+                            }
+
+                            signaling.child("candidates")
+                                .child(side)
+                                .push()
+                                .setValue(
+                                    mapOf(
+                                        "sdp" to candidate.sdp,
+                                        "mid" to (candidate.sdpMid ?: ""),
+                                        "index" to candidate.sdpMLineIndex
+                                    )
+                                )
+                                .addOnFailureListener {
+                                    onStatus("ICE_WRITE_FAILED")
+                                }
+                        }
+                    }
+
+                    override fun onIceCandidatesRemoved(
+                        candidates: Array<out IceCandidate>?
+                    ) {}
+
+                    override fun onAddStream(
+                        stream: MediaStream?
+                    ) {
+                        stream?.videoTracks?.firstOrNull()?.let {
+                            onVideo(it, egl!!.eglBaseContext)
+                        }
+                    }
+
+                    override fun onRemoveStream(
+                        stream: MediaStream?
+                    ) {}
+
+                    override fun onDataChannel(
+                        channel: DataChannel?
+                    ) {}
+
+                    override fun onRenegotiationNeeded() {}
+
+                    override fun onAddTrack(
+                        receiver: RtpReceiver?,
+                        streams: Array<out MediaStream>?
+                    ) {
+                        (receiver?.track() as? VideoTrack)?.let {
+                            onVideo(it, egl!!.eglBaseContext)
+                        }
+                    }
+                }
+            )
+
+            if (peer == null) {
+                onStatus("PEER_CREATION_FAILED")
+                close()
+                return
+            }
+
+            if (controller) {
+                peer!!.addTransceiver(
+                    MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
+                    RtpTransceiver.RtpTransceiverInit(
+                        RtpTransceiver.RtpTransceiverDirection.RECV_ONLY
+                    )
+                )
+            } else {
+                capturer = ScreenCapturerAndroid(
+                    permission!!,
+                    object : MediaProjection.Callback() {
+                        override fun onStop() {
+                            onStatus("SCREEN_CAPTURE_STOPPED")
+                            close()
+                        }
+                    }
+                )
+
+                source = factory!!.createVideoSource(true)
+
+                helper = SurfaceTextureHelper.create(
+                    "ScreenFrames",
+                    egl!!.eglBaseContext
+                )
+
+                capturer!!.initialize(
+                    helper,
+                    context.applicationContext,
+                    source!!.capturerObserver
+                )
+
+                track = factory!!.createVideoTrack(
+                    "screen",
+                    source
+                )
+
+                peer!!.addTrack(
+                    track,
+                    listOf("screen_stream")
+                )
+
+                capturer!!.startCapture(
+                    720,
+                    1280,
+                    15
+                )
+            }
+
+            listen()
+
+            if (controller) makeOffer()
+
+        } catch (e: Exception) {
+            Log.e("WebRtcManager", "Setup error", e)
+            onStatus("SETUP_ERROR: ${e.localizedMessage}")
+            close()
+        }
+    }
+
+    private fun makeOffer() {
+        peer?.createOffer(
+            object : SdpObserver {
+                override fun onCreateSuccess(
+                    sdp: SessionDescription?
+                ) {
+                    sdp?.let { local(it) }
+                }
+
+                override fun onSetSuccess() {}
+
+                override fun onCreateFailure(error: String?) {
+                    onStatus("OFFER_FAILED: $error")
+                }
+
+                override fun onSetFailure(error: String?) {}
+            },
+            MediaConstraints()
+        )
+    }
+
+    private fun makeAnswer() {
+        peer?.createAnswer(
+            object : SdpObserver {
+                override fun onCreateSuccess(
+                    sdp: SessionDescription?
+                ) {
+                    sdp?.let { local(it) }
+                }
+
+                override fun onSetSuccess() {}
+
+                override fun onCreateFailure(error: String?) {
+                    onStatus("ANSWER_FAILED: $error")
+                }
+
+                override fun onSetFailure(error: String?) {}
+            },
+            MediaConstraints()
+        )
+    }
+
+    private fun local(sdp: SessionDescription) {
+        peer?.setLocalDescription(
+            object : SdpObserver {
+                override fun onCreateSuccess(
+                    sdp: SessionDescription?
+                ) {}
+
+                override fun onSetSuccess() {
+                    if (!closed) {
+                        signaling.child(
+                            if (controller) "offer" else "answer"
+                        ).setValue(
+                            mapOf(
+                                "type" to sdp.type.name,
+                                "sdp" to sdp.description
+                            )
+                        ).addOnFailureListener {
+                            onStatus("SDP_WRITE_FAILED")
+                        }
                     }
                 }
 
-                val remoteSide = if (isCaller) {
+                override fun onCreateFailure(error: String?) {}
+
+                override fun onSetFailure(error: String?) {
+                    onStatus("LOCAL_SDP_FAILED: $error")
+                }
+            },
+            sdp
+        )
+    }
+
+    private fun remote(sdp: SessionDescription) {
+        if (remotePending || remoteSet || closed) return
+
+        remotePending = true
+
+        peer?.setRemoteDescription(
+            object : SdpObserver {
+                override fun onCreateSuccess(
+                    sdp: SessionDescription?
+                ) {}
+
+                override fun onSetSuccess() {
+                    remotePending = false
+                    remoteSet = true
+
+                    candidates.forEach {
+                        peer?.addIceCandidate(it)
+                    }
+
+                    candidates.clear()
+
+                    if (!controller) makeAnswer()
+                }
+
+                override fun onCreateFailure(error: String?) {}
+
+                override fun onSetFailure(error: String?) {
+                    remotePending = false
+                    onStatus("REMOTE_SDP_FAILED: $error")
+                }
+            },
+            sdp
+        )
+    }
+
+    private fun listen() {
+        signalListener = object : ValueEventListener {
+
+            override fun onDataChange(snapshot: DataSnapshot) {
+                if (closed || !authorized) return
+
+                val sdp = snapshot.child(
+                    if (controller) "answer" else "offer"
+                ).child("sdp").getValue(String::class.java)
+
+                if (
+                    sdp != null &&
+                    !remoteSet &&
+                    !remotePending
+                ) {
+                    remote(
+                        SessionDescription(
+                            if (controller) {
+                                SessionDescription.Type.ANSWER
+                            } else {
+                                SessionDescription.Type.OFFER
+                            },
+                            sdp
+                        )
+                    )
+                }
+
+                val side = if (controller) {
                     "receiver"
                 } else {
-                    "caller"
+                    "controller"
                 }
 
                 snapshot.child("candidates")
-                    .child(remoteSide)
+                    .child(side)
                     .children
-                    .forEach { child ->
+                    .forEach { item ->
 
-                        val key = child.key ?: return@forEach
+                        val id = item.key ?: return@forEach
 
-                        if (!processedCandidates.add(key)) {
-                            return@forEach
-                        }
+                        if (!seen.add(id)) return@forEach
 
-                        val candidateSdp = child.child("sdp")
+                        val text = item.child("sdp")
                             .getValue(String::class.java)
                             ?: return@forEach
 
-                        val mid = child.child("sdpMid")
+                        val mid = item.child("mid")
                             .getValue(String::class.java)
 
-                        val index = child.child("sdpMLineIndex")
+                        val index = item.child("index")
                             .getValue(Int::class.java) ?: 0
 
                         val candidate = IceCandidate(
                             mid,
                             index,
-                            candidateSdp
+                            text
                         )
 
-                        if (remoteDescriptionSet) {
-                            peerConnection?.addIceCandidate(candidate)
+                        if (remoteSet) {
+                            peer?.addIceCandidate(candidate)
                         } else {
-                            pendingCandidates.add(candidate)
+                            candidates.add(candidate)
                         }
                     }
             }
 
             override fun onCancelled(error: DatabaseError) {
-                Log.e(TAG, "Signaling error: ${error.message}")
-                onConnectionState("SIGNALING_ERROR")
+                onStatus("SIGNALING_DENIED: ${error.message}")
             }
         }
 
-        database.addValueEventListener(signalingListener!!)
+        signaling.addValueEventListener(signalListener!!)
     }
 
     fun close() {
+        if (closed) return
 
         closed = true
+        authorized = false
 
-        signalingListener?.let {
-            database.removeEventListener(it)
+        pairingListener?.let {
+            pairing.removeEventListener(it)
         }
 
-        signalingListener = null
+        signalListener?.let {
+            signaling.removeEventListener(it)
+        }
 
-        peerConnection?.close()
-        peerConnection?.dispose()
-        peerConnection = null
+        pairingListener = null
+        signalListener = null
+
+        try {
+            capturer?.stopCapture()
+        } catch (_: Exception) {}
+
+        capturer?.dispose()
+        capturer = null
+
+        peer?.close()
+        peer?.dispose()
+        peer = null
+
+        track?.dispose()
+        track = null
+
+        source?.dispose()
+        source = null
+
+        helper?.dispose()
+        helper = null
 
         factory?.dispose()
         factory = null
+
+        egl?.release()
+        egl = null
+
+        candidates.clear()
+        seen.clear()
     }
 }
