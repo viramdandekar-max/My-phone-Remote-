@@ -255,7 +255,7 @@ class WebRtcManager(
                 capturer!!.startCapture(
                     720,
                     1280,
-                    15
+                    60
                 )
             }
 
