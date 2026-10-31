@@ -8,55 +8,37 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.Bitmap
-import android.graphics.PixelFormat
-import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
-import android.media.ImageReader
 import android.media.projection.MediaProjection
-import android.media.projection.MediaProjectionManager
 import android.os.Build
-import android.os.Handler
-import android.os.HandlerThread
 import android.os.IBinder
 import android.util.Log
+import org.webrtc.*
 
 class ScreenShareService : Service() {
 
     companion object {
         const val CHANNEL_ID = "screen_share_channel"
         const val NOTIFICATION_ID = 1001
-
-        const val ACTION_START =
-            "com.myphoneremote.START_SCREEN_SHARE"
-
-        const val ACTION_STOP =
-            "com.myphoneremote.STOP_SCREEN_SHARE"
-
+        const val ACTION_START = "com.myphoneremote.START_SCREEN_SHARE"
+        const val ACTION_STOP = "com.myphoneremote.STOP_SCREEN_SHARE"
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
-
         private const val TAG = "ScreenShareService"
     }
 
-    private var mediaProjection: MediaProjection? = null
-    private var virtualDisplay: VirtualDisplay? = null
-    private var imageReader: ImageReader? = null
+    private var peerConnectionFactory: PeerConnectionFactory? = null
+    private var eglBase: EglBase? = null
+    private var screenCapturer: ScreenCapturerAndroid? = null
+    private var videoSource: VideoSource? = null
+    private var videoTrack: VideoTrack? = null
+    private var surfaceTextureHelper: SurfaceTextureHelper? = null
 
-    private var captureThread: HandlerThread? = null
-    private var captureHandler: Handler? = null
-
-    private var lastFrameTime = 0L
-    private var isCapturing = false
-
-    private val projectionCallback =
-        object : MediaProjection.Callback() {
-
-            override fun onStop() {
-                Log.d(TAG, "MediaProjection stopped")
-                stopSelf()
-            }
+    private val projectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            Log.d(TAG, "Screen sharing stopped by Android")
+            stopSelf()
         }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -67,9 +49,8 @@ class ScreenShareService : Service() {
             NotificationManager.IMPORTANCE_LOW
         )
 
-        getSystemService(
-            NotificationManager::class.java
-        ).createNotificationChannel(channel)
+        getSystemService(NotificationManager::class.java)
+            .createNotificationChannel(channel)
     }
 
     override fun onStartCommand(
@@ -88,10 +69,7 @@ class ScreenShareService : Service() {
             return START_NOT_STICKY
         }
 
-        val resultCode = intent.getIntExtra(
-            EXTRA_RESULT_CODE,
-            0
-        )
+        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
 
         val resultData = if (Build.VERSION.SDK_INT >= 33) {
             intent.getParcelableExtra(
@@ -100,24 +78,19 @@ class ScreenShareService : Service() {
             )
         } else {
             @Suppress("DEPRECATION")
-            intent.getParcelableExtra<Intent>(
-                EXTRA_RESULT_DATA
-            )
+            intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
         }
 
-        if (
-            resultCode != Activity.RESULT_OK ||
-            resultData == null
-        ) {
+        if (resultCode != Activity.RESULT_OK || resultData == null) {
             stopSelf()
             return START_NOT_STICKY
         }
 
         try {
             startCaptureNotification()
-            startScreenCapture(resultCode, resultData)
+            startWebRtcCapture(resultData)
         } catch (e: Exception) {
-            Log.e(TAG, "Screen capture failed", e)
+            Log.e(TAG, "WebRTC screen capture failed", e)
             stopSelf()
         }
 
@@ -125,7 +98,6 @@ class ScreenShareService : Service() {
     }
 
     private fun startCaptureNotification() {
-
         val stopIntent = Intent(
             this,
             ScreenShareService::class.java
@@ -141,15 +113,10 @@ class ScreenShareService : Service() {
                 PendingIntent.FLAG_IMMUTABLE
         )
 
-        val notification = Notification.Builder(
-            this,
-            CHANNEL_ID
-        )
+        val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("My Phone Remote")
-            .setContentText("Screen capture is active")
-            .setSmallIcon(
-                android.R.drawable.ic_menu_camera
-            )
+            .setContentText("Screen sharing is active")
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setOngoing(true)
             .addAction(
                 Notification.Action.Builder(
@@ -164,145 +131,101 @@ class ScreenShareService : Service() {
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo
-                    .FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
             )
         } else {
-            startForeground(
-                NOTIFICATION_ID,
-                notification
-            )
+            startForeground(NOTIFICATION_ID, notification)
         }
     }
 
-    private fun startScreenCapture(
-        resultCode: Int,
-        resultData: Intent
-    ) {
+    private fun startWebRtcCapture(resultData: Intent) {
 
-        val projectionManager = getSystemService(
-            MEDIA_PROJECTION_SERVICE
-        ) as MediaProjectionManager
-
-        val projection = projectionManager.getMediaProjection(
-            resultCode,
-            resultData
+        PeerConnectionFactory.initialize(
+            PeerConnectionFactory.InitializationOptions
+                .builder(applicationContext)
+                .createInitializationOptions()
         )
 
-        mediaProjection = projection
+        eglBase = EglBase.create()
 
-        captureThread = HandlerThread(
-            "ScreenCaptureThread"
-        ).apply {
-            start()
-        }
-
-        captureHandler = Handler(
-            captureThread!!.looper
+        val encoderFactory = DefaultVideoEncoderFactory(
+            eglBase!!.eglBaseContext,
+            true,
+            true
         )
 
-        projection.registerCallback(
-            projectionCallback,
-            captureHandler
+        val decoderFactory = DefaultVideoDecoderFactory(
+            eglBase!!.eglBaseContext
         )
 
-        val metrics = resources.displayMetrics
+        peerConnectionFactory = PeerConnectionFactory.builder()
+            .setVideoEncoderFactory(encoderFactory)
+            .setVideoDecoderFactory(decoderFactory)
+            .createPeerConnectionFactory()
 
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val density = metrics.densityDpi
-
-        imageReader = ImageReader.newInstance(
-            width,
-            height,
-            PixelFormat.RGBA_8888,
-            2
+        screenCapturer = ScreenCapturerAndroid(
+            resultData,
+            projectionCallback
         )
 
-        virtualDisplay = projection.createVirtualDisplay(
-            "MyPhoneRemoteCapture",
-            width,
-            height,
-            density,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader!!.surface,
-            null,
-            captureHandler
+        videoSource = peerConnectionFactory!!
+            .createVideoSource(true)
+
+        surfaceTextureHelper = SurfaceTextureHelper.create(
+            "ScreenCaptureThread",
+            eglBase!!.eglBaseContext
         )
 
-        isCapturing = true
-
-        imageReader?.setOnImageAvailableListener(
-            { reader ->
-
-                val image = try {
-                    reader.acquireLatestImage()
-                } catch (e: Exception) {
-                    null
-                }
-
-                if (image != null) {
-                    try {
-                        val now = System.currentTimeMillis()
-
-                        if (now - lastFrameTime >= 500) {
-                            lastFrameTime = now
-
-                            Log.d(
-                                TAG,
-                                "Screen frame captured: " +
-                                    "${image.width}x${image.height}"
-                            )
-                        }
-                    } finally {
-                        image.close()
-                    }
-                }
-            },
-            captureHandler
+        screenCapturer!!.initialize(
+            surfaceTextureHelper,
+            applicationContext,
+            videoSource!!.capturerObserver
         )
 
-        Log.d(TAG, "Screen capture started")
+        videoTrack = peerConnectionFactory!!
+            .createVideoTrack(
+                "SCREEN_VIDEO_TRACK",
+                videoSource
+            )
+
+        screenCapturer!!.startCapture(
+            720,
+            1280,
+            15
+        )
+
+        Log.d(TAG, "WebRTC screen capture started")
     }
 
-    private fun stopScreenCapture() {
+    private fun stopWebRtcCapture() {
 
-        if (!isCapturing && mediaProjection == null) {
-            return
+        try {
+            screenCapturer?.stopCapture()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping capture", e)
         }
 
-        isCapturing = false
+        screenCapturer?.dispose()
+        screenCapturer = null
 
-        imageReader?.setOnImageAvailableListener(
-            null,
-            null
-        )
+        videoTrack?.dispose()
+        videoTrack = null
 
-        virtualDisplay?.release()
-        virtualDisplay = null
+        videoSource?.dispose()
+        videoSource = null
 
-        imageReader?.close()
-        imageReader = null
+        surfaceTextureHelper?.dispose()
+        surfaceTextureHelper = null
 
-        val projection = mediaProjection
-        mediaProjection = null
+        peerConnectionFactory?.dispose()
+        peerConnectionFactory = null
 
-        if (projection != null) {
-            projection.unregisterCallback(
-                projectionCallback
-            )
-            projection.stop()
-        }
-
-        captureThread?.quitSafely()
-        captureThread = null
-        captureHandler = null
-
-        Log.d(TAG, "Screen capture stopped")
+        eglBase?.release()
+        eglBase = null
     }
 
     override fun onDestroy() {
-        stopScreenCapture()
+        stopWebRtcCapture()
         super.onDestroy()
     }
 
