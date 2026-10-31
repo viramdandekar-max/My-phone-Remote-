@@ -12,8 +12,8 @@ android {
         applicationId = "com.myphoneremote"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
     }
 
     buildTypes {
@@ -34,8 +34,8 @@ android {
 
 dependencies {
 
+    // Android
     implementation("androidx.core:core-ktx:1.13.1")
-
     implementation("androidx.activity:activity-ktx:1.9.2")
 
     // Firebase BoM
@@ -48,4 +48,7 @@ dependencies {
 
     // Firebase Realtime Database
     implementation("com.google.firebase:firebase-database")
+
+    // WebRTC Android SDK
+    implementation("io.github.webrtc-sdk:android:150.7871.04")
 }
