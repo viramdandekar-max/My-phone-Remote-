@@ -4,6 +4,7 @@
     <application
         android:allowBackup="false"
         android:label="My Phone Remote"
+        android:icon="@drawable/app_icon"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:usesCleartextTraffic="false">
 
@@ -17,5 +18,7 @@
             </intent-filter>
 
         </activity>
+
     </application>
+
 </manifest>
