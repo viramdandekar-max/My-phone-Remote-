@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "330946343803",
+    "project_id": "my-phone-remote-29597",
+    "storage_bucket": "my-phone-remote-29597.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:330946343803:android:99a5d987a5f77b0508c3de",
+        "android_client_info": {
+          "package_name": "com.myphoneremote"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDJdUxsIcYSjzt24WZKB5u_upX91TdLiCg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
