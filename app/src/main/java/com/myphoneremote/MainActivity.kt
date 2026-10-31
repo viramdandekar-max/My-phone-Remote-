@@ -2,6 +2,8 @@ package com.myphoneremote
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.Intent
+import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.graphics.Color
 import android.view.Gravity
@@ -21,7 +23,9 @@ import java.security.SecureRandom
 class MainActivity : Activity() {
 
     private lateinit var layout: LinearLayout
+
     private val auth = FirebaseAuth.getInstance()
+
     private val database: DatabaseReference by lazy {
         FirebaseDatabase.getInstance().reference
     }
@@ -29,6 +33,8 @@ class MainActivity : Activity() {
     private var pairingCode: String? = null
     private var pairingListener: ValueEventListener? = null
     private var pairingRef: DatabaseReference? = null
+
+    private val SCREEN_CAPTURE_REQUEST = 1001
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -102,6 +108,7 @@ class MainActivity : Activity() {
     private fun showHome() {
         removePairingListener()
         createPage("MY PHONE REMOTE")
+
         addText("Select your phone mode")
 
         addButton("PHONE 1 - CONTROLLER") {
@@ -116,6 +123,7 @@ class MainActivity : Activity() {
     private fun showController() {
         removePairingListener()
         createPage("CONTROLLER DASHBOARD")
+
         addText("Phone 1 - OPPO Reno 14")
 
         addButton("CONNECT TO PHONE 2") {
@@ -146,10 +154,15 @@ class MainActivity : Activity() {
     private fun showReceiver() {
         removePairingListener()
         createPage("RECEIVER DASHBOARD")
+
         addText("Phone 2 - Realme 6 Pro")
 
         addButton("PAIR WITH CONTROLLER") {
             generatePairingCode()
+        }
+
+        addButton("START SCREEN SHARING") {
+            requestScreenCapture()
         }
 
         addButton("PERMISSIONS") {
@@ -162,6 +175,49 @@ class MainActivity : Activity() {
 
         addButton("BACK") {
             showHome()
+        }
+    }
+
+    private fun requestScreenCapture() {
+        val manager = getSystemService(
+            MEDIA_PROJECTION_SERVICE
+        ) as MediaProjectionManager
+
+        try {
+            startActivityForResult(
+                manager.createScreenCaptureIntent(),
+                SCREEN_CAPTURE_REQUEST
+            )
+        } catch (e: Exception) {
+            showMessage(
+                "Screen capture request failed: ${e.localizedMessage}"
+            )
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(
+        requestCode: Int,
+        resultCode: Int,
+        data: Intent?
+    ) {
+        super.onActivityResult(requestCode, resultCode, data)
+
+        if (requestCode == SCREEN_CAPTURE_REQUEST) {
+            if (resultCode == RESULT_OK && data != null) {
+                createPage("SCREEN CAPTURE APPROVED")
+
+                addText(
+                    "Screen capture permission granted.\n\n" +
+                    "Screen streaming is not active yet."
+                )
+
+                addButton("BACK TO HOME") {
+                    showHome()
+                }
+            } else {
+                showMessage("Screen capture permission denied")
+            }
         }
     }
 
@@ -184,6 +240,7 @@ class MainActivity : Activity() {
 
         ref.setValue(data).addOnSuccessListener {
             createPage("PHONE 2 PAIRING")
+
             addText("Your pairing code is:")
             addText(code)
             addText("Enter this code on Phone 1.")
@@ -200,7 +257,6 @@ class MainActivity : Activity() {
 
     private fun listenForPairing(ref: DatabaseReference) {
         removePairingListener()
-
         pairingRef = ref
 
         val listener = object : ValueEventListener {
@@ -217,12 +273,15 @@ class MainActivity : Activity() {
                             "Allow Phone 1 to connect to this phone?"
                         )
                         .setPositiveButton("ALLOW") { _, _ ->
-                            ref.child("status").setValue("connected")
+                            ref.child("status")
+                                .setValue("connected")
                                 .addOnSuccessListener {
                                     showConnected()
                                 }
                                 .addOnFailureListener {
-                                    showMessage(it.localizedMessage ?: "Error")
+                                    showMessage(
+                                        it.localizedMessage ?: "Error"
+                                    )
                                 }
                         }
                         .setNegativeButton("DENY") { _, _ ->
@@ -246,7 +305,9 @@ class MainActivity : Activity() {
         removePairingListener()
         createPage("CONNECT TO PHONE 2")
 
-        addText("Enter the 6-digit code shown on Phone 2.")
+        addText(
+            "Enter the 6-digit code shown on Phone 2."
+        )
 
         val input = EditText(this).apply {
             hint = "6-digit pairing code"
@@ -286,12 +347,17 @@ class MainActivity : Activity() {
                 return@addOnSuccessListener
             }
 
-            ref.child("controllerUid").setValue(uid)
+            ref.child("controllerUid")
+                .setValue(uid)
                 .addOnSuccessListener {
-                    ref.child("status").setValue("requested")
+                    ref.child("status")
+                        .setValue("requested")
                         .addOnSuccessListener {
                             createPage("WAITING FOR APPROVAL")
-                            addText("Approve the request on Phone 2.")
+
+                            addText(
+                                "Approve the request on Phone 2."
+                            )
 
                             addButton("BACK") {
                                 showController()
@@ -300,7 +366,9 @@ class MainActivity : Activity() {
                             listenForControllerApproval(ref)
                         }
                         .addOnFailureListener {
-                            showMessage(it.localizedMessage ?: "Error")
+                            showMessage(
+                                it.localizedMessage ?: "Error"
+                            )
                         }
                 }
                 .addOnFailureListener {
@@ -311,7 +379,9 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun listenForControllerApproval(ref: DatabaseReference) {
+    private fun listenForControllerApproval(
+        ref: DatabaseReference
+    ) {
         removePairingListener()
         pairingRef = ref
 
@@ -325,9 +395,12 @@ class MainActivity : Activity() {
                         removePairingListener()
                         showConnected()
                     }
+
                     "denied" -> {
                         removePairingListener()
-                        showMessage("Pairing denied by Phone 2")
+                        showMessage(
+                            "Pairing denied by Phone 2"
+                        )
                         showController()
                     }
                 }
@@ -344,6 +417,7 @@ class MainActivity : Activity() {
 
     private fun showConnected() {
         createPage("CONNECTED")
+
         addText("Phone pairing successful!")
         addText("Both phones are paired.")
 
@@ -361,11 +435,13 @@ class MainActivity : Activity() {
         )
 
         addText(
-            "Pairing code: ${pairingCode ?: "Not generated on this device"}"
+            "Pairing code: " +
+            (pairingCode ?: "Not generated on this device")
         )
 
         addText(
-            "This screen does not yet verify an active remote session."
+            "This screen does not yet verify " +
+            "an active remote session."
         )
 
         addButton("BACK") {
@@ -387,7 +463,11 @@ class MainActivity : Activity() {
     }
 
     private fun showMessage(message: String) {
-        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+        Toast.makeText(
+            this,
+            message,
+            Toast.LENGTH_LONG
+        ).show()
     }
 
     private fun removePairingListener() {
