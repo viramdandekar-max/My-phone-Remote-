@@ -13,11 +13,10 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import com.google.firebase.auth.FirebaseAuth
-import com.google.firebase.database.DataSnapshot
-import com.google.firebase.database.DatabaseError
-import com.google.firebase.database.DatabaseReference
-import com.google.firebase.database.FirebaseDatabase
-import com.google.firebase.database.ValueEventListener
+import com.google.firebase.database.*
+import org.webrtc.EglBase
+import org.webrtc.SurfaceViewRenderer
+import org.webrtc.VideoTrack
 import java.security.SecureRandom
 
 class MainActivity : Activity() {
@@ -26,33 +25,46 @@ class MainActivity : Activity() {
 
     private val auth = FirebaseAuth.getInstance()
 
-    private val database: DatabaseReference by lazy {
+    private val database by lazy {
         FirebaseDatabase.getInstance().reference
     }
 
     private var pairingCode: String? = null
+
     private var pairingListener: ValueEventListener? = null
     private var pairingRef: DatabaseReference? = null
+
+    private var webRtcManager: WebRtcManager? = null
+
+    private var videoRenderer: SurfaceViewRenderer? = null
+    private var rendererEglContext: EglBase.Context? = null
+    private var remoteVideoTrack: VideoTrack? = null
 
     private val SCREEN_CAPTURE_REQUEST = 1001
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        auth.signInAnonymously().addOnCompleteListener { task ->
-            if (task.isSuccessful) {
-                showHome()
-            } else {
-                createPage("CONNECTION ERROR")
+        pairingCode = getPreferences(MODE_PRIVATE)
+            .getString("pairing_code", null)
 
-                addText(
-                    "Firebase Authentication failed: " +
-                    (task.exception?.localizedMessage
-                        ?: "Unknown error")
-                )
+        if (auth.currentUser != null) {
+            showHome()
+        } else {
+            auth.signInAnonymously().addOnCompleteListener { task ->
+                if (task.isSuccessful) {
+                    showHome()
+                } else {
+                    createPage("CONNECTION ERROR")
 
-                addButton("RETRY") {
-                    recreate()
+                    addText(
+                        task.exception?.localizedMessage
+                            ?: "Firebase authentication failed"
+                    )
+
+                    addButton("RETRY") {
+                        recreate()
+                    }
                 }
             }
         }
@@ -62,20 +74,32 @@ class MainActivity : Activity() {
         layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(35, 55, 35, 35)
+            setPadding(30, 45, 30, 30)
             setBackgroundColor(Color.WHITE)
         }
 
         val heading = TextView(this).apply {
             text = title
-            textSize = 25f
+            textSize = 24f
             setTextColor(Color.BLACK)
             gravity = Gravity.CENTER
-            setPadding(0, 20, 0, 40)
+            setPadding(0, 20, 0, 35)
         }
 
         layout.addView(heading)
         setContentView(layout)
+    }
+
+    private fun addText(message: String) {
+        val textView = TextView(this).apply {
+            text = message
+            textSize = 17f
+            setTextColor(Color.DKGRAY)
+            gravity = Gravity.CENTER
+            setPadding(0, 15, 0, 25)
+        }
+
+        layout.addView(textView)
     }
 
     private fun addButton(
@@ -94,29 +118,27 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                bottomMargin = 20
+                bottomMargin = 15
             }
         )
     }
 
-    private fun addText(message: String) {
-        val textView = TextView(this).apply {
-            text = message
-            textSize = 17f
-            setTextColor(Color.DKGRAY)
-            gravity = Gravity.CENTER
-            setPadding(0, 15, 0, 25)
-        }
+    private fun savePairingCode(code: String) {
+        pairingCode = code
 
-        layout.addView(textView)
+        getPreferences(MODE_PRIVATE)
+            .edit()
+            .putString("pairing_code", code)
+            .apply()
     }
 
     private fun showHome() {
         removePairingListener()
+        stopViewer()
 
         createPage("MY PHONE REMOTE")
 
-        addText("Select your phone mode")
+        addText("Choose your phone mode")
 
         addButton("PHONE 1 - CONTROLLER") {
             showController()
@@ -129,6 +151,7 @@ class MainActivity : Activity() {
 
     private fun showController() {
         removePairingListener()
+        stopViewer()
 
         createPage("CONTROLLER DASHBOARD")
 
@@ -138,16 +161,8 @@ class MainActivity : Activity() {
             showControllerPairing()
         }
 
-        addButton("REMOTE CONTROL") {
-            showFeatureInfo("Remote Control")
-        }
-
-        addButton("SCREEN SHARING") {
-            showFeatureInfo("Screen Sharing")
-        }
-
-        addButton("FIND MY PHONE") {
-            showFeatureInfo("Find My Phone")
+        addButton("LIVE SCREEN VIEWER") {
+            startViewer()
         }
 
         addButton("CONNECTION STATUS") {
@@ -161,6 +176,7 @@ class MainActivity : Activity() {
 
     private fun showReceiver() {
         removePairingListener()
+        stopViewer()
 
         createPage("RECEIVER DASHBOARD")
 
@@ -174,8 +190,8 @@ class MainActivity : Activity() {
             requestScreenCapture()
         }
 
-        addButton("PERMISSIONS") {
-            showFeatureInfo("Permissions")
+        addButton("STOP SCREEN SHARING") {
+            stopScreenShareService()
         }
 
         addButton("CONNECTION STATUS") {
@@ -187,7 +203,238 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun generatePairingCode() {
+        removePairingListener()
+
+        val uid = auth.currentUser?.uid ?: return
+
+        val code = (
+            100000 + SecureRandom().nextInt(900000)
+        ).toString()
+
+        val ref = database.child("pairing").child(code)
+
+        val data = mapOf(
+            "receiverUid" to uid,
+            "controllerUid" to "",
+            "status" to "waiting",
+            "createdAt" to System.currentTimeMillis()
+        )
+
+        ref.setValue(data)
+            .addOnSuccessListener {
+                savePairingCode(code)
+
+                createPage("PHONE 2 PAIRING")
+
+                addText("Your pairing code:")
+                addText(code)
+
+                addText("Enter this code on Phone 1.")
+
+                addButton("BACK TO HOME") {
+                    showHome()
+                }
+
+                listenForPairing(ref)
+            }
+            .addOnFailureListener {
+                showMessage(
+                    it.localizedMessage ?: "Pairing failed"
+                )
+            }
+    }
+
+    private fun listenForPairing(ref: DatabaseReference) {
+        removePairingListener()
+
+        pairingRef = ref
+
+        val listener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val status = snapshot.child("status")
+                    .getValue(String::class.java)
+
+                if (status == "requested") {
+                    removePairingListener()
+
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("Pairing Request")
+                        .setMessage(
+                            "Allow Phone 1 to connect?"
+                        )
+                        .setPositiveButton("ALLOW") { _, _ ->
+                            ref.child("status")
+                                .setValue("connected")
+                                .addOnSuccessListener {
+                                    showConnected()
+                                }
+                                .addOnFailureListener {
+                                    showMessage(
+                                        it.localizedMessage ?: "Error"
+                                    )
+                                }
+                        }
+                        .setNegativeButton("DENY") { _, _ ->
+                            ref.child("status")
+                                .setValue("denied")
+                        }
+                        .setCancelable(false)
+                        .show()
+                }
+            }
+
+            override fun onCancelled(error: DatabaseError) {
+                showMessage(error.message)
+            }
+        }
+
+        pairingListener = listener
+        ref.addValueEventListener(listener)
+    }
+
+    private fun showControllerPairing() {
+        removePairingListener()
+
+        createPage("CONNECT TO PHONE 2")
+
+        addText("Enter the 6-digit code from Phone 2")
+
+        val input = EditText(this).apply {
+            hint = "6-digit pairing code"
+
+            inputType =
+                android.text.InputType.TYPE_CLASS_NUMBER
+
+            filters = arrayOf(
+                android.text.InputFilter.LengthFilter(6)
+            )
+        }
+
+        layout.addView(input)
+
+        addButton("CONNECT") {
+            val code = input.text.toString().trim()
+
+            if (!code.matches(Regex("[0-9]{6}"))) {
+                showMessage("Enter a valid 6-digit code")
+            } else {
+                requestPairing(code)
+            }
+        }
+
+        addButton("BACK") {
+            showController()
+        }
+    }
+
+    private fun requestPairing(code: String) {
+        val uid = auth.currentUser?.uid ?: return
+
+        val ref = database.child("pairing").child(code)
+
+        ref.get().addOnSuccessListener { snapshot ->
+            val status = snapshot.child("status")
+                .getValue(String::class.java)
+
+            if (!snapshot.exists() || status != "waiting") {
+                showMessage("Invalid or unavailable pairing code")
+                return@addOnSuccessListener
+            }
+
+            ref.child("controllerUid")
+                .setValue(uid)
+                .addOnSuccessListener {
+                    ref.child("status")
+                        .setValue("requested")
+                        .addOnSuccessListener {
+                            savePairingCode(code)
+
+                            createPage("WAITING FOR APPROVAL")
+
+                            addText(
+                                "Approve connection on Phone 2"
+                            )
+
+                            addButton("BACK") {
+                                showController()
+                            }
+
+                            listenForControllerApproval(ref)
+                        }
+                        .addOnFailureListener {
+                            showMessage(
+                                it.localizedMessage ?: "Error"
+                            )
+                        }
+                }
+                .addOnFailureListener {
+                    showMessage(
+                        it.localizedMessage ?: "Error"
+                    )
+                }
+        }.addOnFailureListener {
+            showMessage(it.localizedMessage ?: "Error")
+        }
+    }
+
+    private fun listenForControllerApproval(
+        ref: DatabaseReference
+    ) {
+        removePairingListener()
+
+        pairingRef = ref
+
+        val listener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val status = snapshot.child("status")
+                    .getValue(String::class.java)
+
+                when (status) {
+                    "connected" -> {
+                        removePairingListener()
+                        showConnected()
+                    }
+
+                    "denied" -> {
+                        removePairingListener()
+                        showMessage("Pairing denied")
+                        showController()
+                    }
+                }
+            }
+
+            override fun onCancelled(error: DatabaseError) {
+                showMessage(error.message)
+            }
+        }
+
+        pairingListener = listener
+        ref.addValueEventListener(listener)
+    }
+
+    private fun showConnected() {
+        createPage("CONNECTED")
+
+        addText("Phone pairing successful!")
+
+        addButton("CONTROLLER DASHBOARD") {
+            showController()
+        }
+
+        addButton("RECEIVER DASHBOARD") {
+            showReceiver()
+        }
+    }
+
     private fun requestScreenCapture() {
+        val code = pairingCode
+
+        if (code.isNullOrBlank()) {
+            showMessage("Pair with Phone 1 first")
+            return
+        }
+
         val manager = getSystemService(
             MEDIA_PROJECTION_SERVICE
         ) as MediaProjectionManager
@@ -199,8 +446,7 @@ class MainActivity : Activity() {
             )
         } catch (e: Exception) {
             showMessage(
-                "Screen capture request failed: " +
-                e.localizedMessage
+                e.localizedMessage ?: "Capture request failed"
             )
         }
     }
@@ -217,59 +463,59 @@ class MainActivity : Activity() {
             data
         )
 
-        if (requestCode == SCREEN_CAPTURE_REQUEST) {
+        if (requestCode != SCREEN_CAPTURE_REQUEST) return
 
-            if (resultCode == RESULT_OK && data != null) {
+        if (resultCode != RESULT_OK || data == null) {
+            showMessage("Screen capture permission denied")
+            return
+        }
 
-                val serviceIntent = Intent(
-                    this,
-                    ScreenShareService::class.java
-                ).apply {
+        val code = pairingCode ?: return
 
-                    action = ScreenShareService.ACTION_START
+        val serviceIntent = Intent(
+            this,
+            ScreenShareService::class.java
+        ).apply {
+            action = ScreenShareService.ACTION_START
 
-                    putExtra(
-                        ScreenShareService.EXTRA_RESULT_CODE,
-                        resultCode
-                    )
+            putExtra(
+                ScreenShareService.EXTRA_RESULT_CODE,
+                resultCode
+            )
 
-                    putExtra(
-                        ScreenShareService.EXTRA_RESULT_DATA,
-                        data
-                    )
-                }
+            putExtra(
+                ScreenShareService.EXTRA_RESULT_DATA,
+                data
+            )
 
-                try {
-                    startForegroundService(serviceIntent)
+            putExtra(
+                ScreenShareService.EXTRA_PAIRING_CODE,
+                code
+            )
+        }
 
-                    createPage("SCREEN CAPTURE APPROVED")
+        try {
+            startForegroundService(serviceIntent)
 
-                    addText(
-                        "Screen capture permission granted.\n\n" +
-                        "Screen sharing service is starting.\n\n" +
-                        "Live screen streaming is not active yet."
-                    )
+            createPage("SCREEN SHARING")
 
-                    addButton("STOP SERVICE") {
-                        stopScreenShareService()
-                    }
+            addText(
+                "Screen sharing service started.\n" +
+                "Open LIVE SCREEN VIEWER on Phone 1."
+            )
 
-                    addButton("BACK TO HOME") {
-                        showHome()
-                    }
-
-                } catch (e: Exception) {
-                    showMessage(
-                        "Unable to start screen sharing service: " +
-                        e.localizedMessage
-                    )
-                }
-
-            } else {
-                showMessage(
-                    "Screen capture permission denied"
-                )
+            addButton("STOP SCREEN SHARING") {
+                stopScreenShareService()
             }
+
+            addButton("BACK") {
+                showReceiver()
+            }
+
+        } catch (e: Exception) {
+            showMessage(
+                e.localizedMessage ?: "Unable to start service"
+            )
         }
     }
 
@@ -277,282 +523,107 @@ class MainActivity : Activity() {
         val intent = Intent(
             this,
             ScreenShareService::class.java
-        )
-
-        stopService(intent)
-
-        showMessage("Screen sharing service stopped")
-
-        showHome()
-    }
-
-    private fun generatePairingCode() {
-        removePairingListener()
-
-        val uid = auth.currentUser?.uid ?: return
-
-        val code = (
-            100000 + SecureRandom().nextInt(900000)
-        ).toString()
-
-        pairingCode = code
-
-        val ref = database
-            .child("pairing")
-            .child(code)
-
-        val data = mapOf(
-            "receiverUid" to uid,
-            "status" to "waiting",
-            "controllerUid" to "",
-            "createdAt" to System.currentTimeMillis()
-        )
-
-        ref.setValue(data)
-            .addOnSuccessListener {
-
-                createPage("PHONE 2 PAIRING")
-
-                addText("Your pairing code is:")
-                addText(code)
-                addText("Enter this code on Phone 1.")
-
-                addButton("BACK TO HOME") {
-                    showHome()
-                }
-
-                listenForPairing(ref)
-
-            }
-            .addOnFailureListener {
-                showMessage(
-                    "Failed: ${it.localizedMessage}"
-                )
-            }
-    }
-
-    private fun listenForPairing(
-        ref: DatabaseReference
-    ) {
-        removePairingListener()
-
-        pairingRef = ref
-
-        val listener = object : ValueEventListener {
-
-            override fun onDataChange(
-                snapshot: DataSnapshot
-            ) {
-                val status = snapshot
-                    .child("status")
-                    .getValue(String::class.java)
-
-                if (status == "requested") {
-
-                    removePairingListener()
-
-                    AlertDialog.Builder(this@MainActivity)
-                        .setTitle("Pairing Request")
-                        .setMessage(
-                            "Allow Phone 1 to connect to this phone?"
-                        )
-                        .setPositiveButton("ALLOW") { _, _ ->
-
-                            ref.child("status")
-                                .setValue("connected")
-                                .addOnSuccessListener {
-                                    showConnected()
-                                }
-                                .addOnFailureListener {
-                                    showMessage(
-                                        it.localizedMessage
-                                            ?: "Error"
-                                    )
-                                }
-                        }
-                        .setNegativeButton("DENY") { _, _ ->
-                            ref.child("status")
-                                .setValue("denied")
-                        }
-                        .setCancelable(false)
-                        .show()
-                }
-            }
-
-            override fun onCancelled(
-                error: DatabaseError
-            ) {
-                showMessage(error.message)
-            }
+        ).apply {
+            action = ScreenShareService.ACTION_STOP
         }
 
-        pairingListener = listener
+        startService(intent)
 
-        ref.addValueEventListener(listener)
+        showMessage("Screen sharing stopped")
+        showReceiver()
     }
 
-    private fun showControllerPairing() {
-        removePairingListener()
+    private fun startViewer() {
+        val code = pairingCode
 
-        createPage("CONNECT TO PHONE 2")
+        if (code.isNullOrBlank()) {
+            showMessage("Pair with Phone 2 first")
+            return
+        }
 
-        addText(
-            "Enter the 6-digit code shown on Phone 2."
-        )
+        stopViewer()
 
-        val input = EditText(this).apply {
-            hint = "6-digit pairing code"
+        createPage("LIVE SCREEN VIEWER")
 
-            inputType =
-                android.text.InputType.TYPE_CLASS_NUMBER
+        val statusText = TextView(this).apply {
+            text = "Connecting..."
+            textSize = 16f
+            setTextColor(Color.DKGRAY)
+            gravity = Gravity.CENTER
+        }
 
-            filters = arrayOf(
-                android.text.InputFilter.LengthFilter(6)
+        layout.addView(statusText)
+
+        val renderer = SurfaceViewRenderer(this)
+
+        videoRenderer = renderer
+
+        layout.addView(
+            renderer,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
             )
-        }
+        )
 
-        layout.addView(input)
-
-        addButton("CONNECT") {
-
-            val code = input.text.toString().trim()
-
-            if (code.length != 6) {
-                showMessage(
-                    "Enter a valid 6-digit code"
-                )
-            } else {
-                requestPairing(code)
-            }
-        }
-
-        addButton("BACK") {
+        addButton("STOP VIEWER") {
+            stopViewer()
             showController()
         }
-    }
 
-    private fun requestPairing(code: String) {
-        val uid = auth.currentUser?.uid ?: return
+        webRtcManager = WebRtcManager(
+            context = applicationContext,
+            code = code,
+            controller = true,
 
-        val ref = database
-            .child("pairing")
-            .child(code)
+            onVideo = { track, eglContext ->
+                runOnUiThread {
+                    if (videoRenderer !== renderer) {
+                        return@runOnUiThread
+                    }
 
-        ref.get()
-            .addOnSuccessListener { snapshot ->
+                    if (rendererEglContext == null) {
+                        renderer.init(eglContext, null)
+                        rendererEglContext = eglContext
+                    }
 
-                val status = snapshot
-                    .child("status")
-                    .getValue(String::class.java)
+                    remoteVideoTrack?.removeSink(renderer)
 
-                if (
-                    !snapshot.exists() ||
-                    status != "waiting"
-                ) {
-                    showMessage(
-                        "Invalid or unavailable pairing code"
-                    )
-                    return@addOnSuccessListener
+                    remoteVideoTrack = track
+                    track.addSink(renderer)
+
+                    statusText.text = "LIVE SCREEN"
                 }
+            },
 
-                ref.child("controllerUid")
-                    .setValue(uid)
-                    .addOnSuccessListener {
-
-                        ref.child("status")
-                            .setValue("requested")
-                            .addOnSuccessListener {
-
-                                createPage(
-                                    "WAITING FOR APPROVAL"
-                                )
-
-                                addText(
-                                    "Approve the request on Phone 2."
-                                )
-
-                                addButton("BACK") {
-                                    showController()
-                                }
-
-                                listenForControllerApproval(ref)
-                            }
-                            .addOnFailureListener {
-                                showMessage(
-                                    it.localizedMessage
-                                        ?: "Error"
-                                )
-                            }
-                    }
-                    .addOnFailureListener {
-                        showMessage(
-                            it.localizedMessage ?: "Error"
-                        )
-                    }
-            }
-            .addOnFailureListener {
-                showMessage(
-                    it.localizedMessage ?: "Error"
-                )
-            }
-    }
-
-    private fun listenForControllerApproval(
-        ref: DatabaseReference
-    ) {
-        removePairingListener()
-
-        pairingRef = ref
-
-        val listener = object : ValueEventListener {
-
-            override fun onDataChange(
-                snapshot: DataSnapshot
-            ) {
-                val status = snapshot
-                    .child("status")
-                    .getValue(String::class.java)
-
-                when (status) {
-
-                    "connected" -> {
-                        removePairingListener()
-                        showConnected()
-                    }
-
-                    "denied" -> {
-                        removePairingListener()
-
-                        showMessage(
-                            "Pairing denied by Phone 2"
-                        )
-
-                        showController()
+            onStatus = { status ->
+                runOnUiThread {
+                    if (videoRenderer === renderer) {
+                        statusText.text = "Status: $status"
                     }
                 }
             }
+        )
 
-            override fun onCancelled(
-                error: DatabaseError
-            ) {
-                showMessage(error.message)
-            }
-        }
-
-        pairingListener = listener
-
-        ref.addValueEventListener(listener)
+        webRtcManager?.start()
     }
 
-    private fun showConnected() {
-        createPage("CONNECTED")
+    private fun stopViewer() {
+        val renderer = videoRenderer
 
-        addText("Phone pairing successful!")
-        addText("Both phones are paired.")
-
-        addButton("BACK TO HOME") {
-            showHome()
+        if (renderer != null) {
+            remoteVideoTrack?.removeSink(renderer)
         }
+
+        remoteVideoTrack = null
+
+        webRtcManager?.close()
+        webRtcManager = null
+
+        renderer?.release()
+        videoRenderer = null
+        rendererEglContext = null
     }
 
     private fun showConnectionStatus() {
@@ -560,35 +631,20 @@ class MainActivity : Activity() {
 
         addText(
             "Firebase Authentication: " +
-            if (auth.currentUser != null) {
-                "Active"
-            } else {
-                "Inactive"
-            }
+                if (auth.currentUser != null) {
+                    "Active"
+                } else {
+                    "Inactive"
+                }
         )
 
         addText(
             "Pairing code: " +
-            (pairingCode
-                ?: "Not generated on this device")
+                (pairingCode ?: "Not paired")
         )
 
         addText(
-            "This screen does not yet verify " +
-            "an active remote session."
-        )
-
-        addButton("BACK") {
-            showHome()
-        }
-    }
-
-    private fun showFeatureInfo(feature: String) {
-        createPage(feature.uppercase())
-
-        addText(
-            "$feature is not active yet. " +
-            "Additional Android services and permissions are required."
+            "Live connection status is shown in the viewer."
         )
 
         addButton("BACK TO HOME") {
@@ -618,6 +674,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         removePairingListener()
+        stopViewer()
         super.onDestroy()
     }
 
